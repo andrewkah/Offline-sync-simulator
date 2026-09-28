@@ -57,3 +57,56 @@ class SyncResponse(BaseModel):
     dropped_records: List[DroppedItem]
 
 
+@app.post(
+    "/api/v1/sync/pdp-batch",
+    response_model=SyncResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def sync_pdp_batch(payload: BatchPayload, db: Session = Depends(db.get_db)):
+    seen: Set[str] = set()
+    committed: List[dict] = []
+    dropped: List[dict] = []
+
+    for item in payload.records:
+        item = PDPData.validate_pdp_status()
+        # Promote Idempotency
+        uuid_str = str(item.submission_uuid)
+        db_item = db.query(db.PDPModel).filter(db.PDPModel.id == uuid_str).first()
+        if uuid_str in seen or db_item is not None:
+            reason = (
+                f"Duplicate submission_uuid '{uuid_str}' detected. It has been dropped."
+                if uuid_str in seen
+                else f"Submission_uuid '{uuid_str}' already saved."
+            )
+            # Add duplicate to dropped set
+            dropped.append(
+                DroppedItem(
+                    submission_uuid=uuid_str,
+                    urban_council=item.urban_council,
+                    reason=reason,
+                )
+            )
+            continue
+        seen.add(uuid_str)
+        # Save to the db
+        save_db_item = db.PDPModel(
+            id=uuid_str,
+            urban_council=item.urban_council,
+            pdp_status=item.pdp_status.value,
+            expiry_year=item.expiry_year,
+            field_officer_timestamp=item.field_officer_timestamp.isoformat(),
+            committed_at=datetime.now().isoformat(),
+        )
+        db.add(save_db_item)
+        db.commit()
+        db.refresh(save_db_item)
+        committed.append(save_db_item)
+    return SyncResponse(
+        batch_status="PROCESSED",
+        total_received=len(payload.records),
+        total_synced=len(committed),
+        duplicates_dropped=len(dropped),
+        committed_records=committed,
+        dropped_records=dropped,
+    )
+
