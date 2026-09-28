@@ -1,0 +1,6 @@
+*.log
+.venv*
+!.env.example
+uv.lock
+*.pyc
+.DS_Store
