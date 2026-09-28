@@ -2,11 +2,11 @@ from datetime import datetime
 from enum import Enum
 from typing import List, Optional, Set
 from uuid import UUID
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from fastapi import FastAPI, status, Depends
-from src import db
+import db
 
 app = FastAPI()
 
@@ -31,13 +31,6 @@ class PDPData(BaseModel):
     expiry_year: Optional[int] = Field(..., ge=1, le=9999)
     field_officer_timestamp: datetime
 
-    @model_validator(mode="after")
-    def validate_pdp_status(self) -> "PDPData":
-        if self.pdp_status in PDPStatus:
-            raise ValueError(f"Unknown pdp_status!")
-        return self
-
-
 class BatchPayload(BaseModel):
     records: List[PDPData]
 
@@ -51,7 +44,7 @@ class DroppedItem(BaseModel):
 class SyncResponse(BaseModel):
     batch_status: str
     total_received: int
-    total_synced: int
+    committed_count: int
     duplicates_dropped: int
     committed_records: List[dict]
     dropped_records: List[DroppedItem]
@@ -62,16 +55,15 @@ class SyncResponse(BaseModel):
     response_model=SyncResponse,
     status_code=status.HTTP_200_OK,
 )
-async def sync_pdp_batch(payload: BatchPayload, db: Session = Depends(db.get_db)):
+async def sync_pdp_batch(payload: BatchPayload, session: Session = Depends(db.get_db)):
     seen: Set[str] = set()
     committed: List[dict] = []
     dropped: List[dict] = []
 
     for item in payload.records:
-        item = PDPData.validate_pdp_status()
         # Promote Idempotency
         uuid_str = str(item.submission_uuid)
-        db_item = db.query(db.PDPModel).filter(db.PDPModel.id == uuid_str).first()
+        db_item = session.query(db.PDPModel).filter(db.PDPModel.id == uuid_str).first()
         if uuid_str in seen or db_item is not None:
             reason = (
                 f"Duplicate submission_uuid '{uuid_str}' detected. It has been dropped."
@@ -94,17 +86,25 @@ async def sync_pdp_batch(payload: BatchPayload, db: Session = Depends(db.get_db)
             urban_council=item.urban_council,
             pdp_status=item.pdp_status.value,
             expiry_year=item.expiry_year,
-            field_officer_timestamp=item.field_officer_timestamp.isoformat(),
-            committed_at=datetime.now().isoformat(),
+            field_officer_timestamp=item.field_officer_timestamp,
+            committed_at=datetime.now(),
         )
-        db.add(save_db_item)
-        db.commit()
-        db.refresh(save_db_item)
-        committed.append(save_db_item)
+        session.add(save_db_item)
+        session.commit()
+        session.refresh(save_db_item)
+        committed.append(
+            {
+                "submission_uuid": uuid_str,
+                "urban_council": item.urban_council,
+                "pdp_status": item.pdp_status.value,
+                "expiry_year": item.expiry_year,
+                "field_officer_timestamp": item.field_officer_timestamp,
+            }
+        )
     return SyncResponse(
         batch_status="PROCESSED",
         total_received=len(payload.records),
-        total_synced=len(committed),
+        committed_count=len(committed),
         duplicates_dropped=len(dropped),
         committed_records=committed,
         dropped_records=dropped,
